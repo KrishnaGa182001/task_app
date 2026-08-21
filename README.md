@@ -136,61 +136,73 @@ Upgrades a seat to VIP and creates an audit log entry (Admin only).
 
 ---
 
-## Architecture Notes
+## Architectural Reasoning & Scalability
 
-### Why Deterministic Lock Ordering?
-Sorting seat IDs (`sort($seatIds)`) before calling `lockForUpdate()` prevents cyclic lock wait deadlocks in MySQL when two users request the same set of seats in opposite orders.
+### 1. Redis Locks vs. Database Locking
+* **Database Approach (Current Implementation)**: Uses MySQL `SELECT ... FOR UPDATE` inside `DB::transaction()`. Guarantees ACID strict consistency where seat status and booking creation happen atomically in the same database engine.
+* **Redis Approach (`Cache::lock()`)**: Under extreme traffic drops (e.g. 50,000 requests/sec), Redis distributed locks (`Cache::lock("seat:{$id}", 10)`) can be used as an ultra-fast non-blocking filter layer in front of MySQL to reject excess requests before they touch the database. MySQL remains the authoritative transactional source of truth.
 
-### Expiry vs. Payment Race Condition
-Both payment processing and expiration jobs acquire row locks (`lockForUpdate()`) on the `bookings` table row. The first operation to acquire the lock changes the state (to `paid` or `expired`), preventing the second operation from running against an invalid state.
+### 2. Optimistic vs. Pessimistic Locking Tradeoffs
+* **Pessimistic Locking (`lockForUpdate()`) [Chosen]**: Holds row locks during the transaction. Best suited for high-demand ticket sales where seat contention is intense. It avoids wasted application CPU cycles and repeated retry loops.
+* **Optimistic Locking (`version` column)**: Updates rows using `WHERE id = ? AND version = ?`. Ideal for low-contention systems. Under heavy ticket drops, 99% of optimistic update attempts fail at commit time, triggering massive application retries and burning CPU resources.
 
-### Redis Locks vs. MySQL Row Locking
-MySQL pessimistic locking (`SELECT ... FOR UPDATE`) is used here as the authoritative source of truth for ACID consistency. In production under extreme loads (e.g. 100,000 requests/sec), Redis distributed locks (`Cache::lock`) can be placed in front of MySQL as an ultra-fast non-blocking filter layer.
+### 3. Queue Processing for 10,000 Bookings / Minute
+To handle 10,000 expirations per minute without locking up MySQL:
+* **Batch Dispatching**: The scheduler (`bookings:expire`) queries expired pending booking IDs in small chunked batches (e.g. 500 IDs per chunk) to avoid long table scans.
+* **Queued Worker Pool**: Dispatches lightweight `ExpireBooking($id)` jobs to a Redis queue processed by multiple worker pods (e.g. 20–50 horizon workers). Each worker locks only 1 specific booking row in <10ms, handling 10,000 expirations per minute cleanly without database lock bloat.
 
+### 4. Database Partitioning & Seat Sharding for 100,000 Seats
+For massive venues with 100,000+ seats:
+* **Database Partitioning**: Range/Hash partition the `seats` table by `event_id` and index `(event_id, status)`.
+* **Horizontal Seat Sharding**: Route requests for different seat sections or events to separate database shards (e.g. Section A to Shard 1, Section B to Shard 2).
+* **Redis Availability Set**: Cache available seat IDs in Redis Sets/Bitmaps to serve read-heavy venue mapping queries without querying MySQL.
 
+---
 
-####This is how the application works diagram.
+## System Flow Architecture
 
+```text
                          HIGH CONCURRENCY
+                                │
+                                ▼
+                     ┌────────────────────┐
+                     │  POST /api/book    │
+                     └─────────┬──────────┘
+                               │
+                          DB Transaction
                                │
                                ▼
-                    ┌────────────────────┐
-                    │  POST /api/book    │
-                    └─────────┬──────────┘
-                              │
-                         DB Transaction
-                              │
-                              ▼
-                       lockForUpdate()
-                              │
-                              ▼
-                    ┌────────────────────┐
-                    │ Is every seat      │
-                    │ available?         │
-                    └──────┬───────┬─────┘
-                           │       │
-                          NO      YES
-                           │       │
-                       ROLLBACK    ▼
-                               Create booking
-                                    │
-                               10-min hold
-                                    │
-                              Seats RESERVED
-                                    │
-                       ┌────────────┴───────────┐
-                       │                        │
-                    PAYMENT                  EXPIRY
-                       │                        │
-                  Lock booking             Lock booking
-                       │                        │
-                  Still pending?            Still pending?
-                  Not expired?             Expired?
-                       │                        │
-                       ▼                        ▼
-                  PAID + BOOKED          EXPIRED + AVAILABLE
-                       │                        │
-                       └──────────┬─────────────┘
-                                  │
-                                  ▼
-                           CONSISTENT STATE
+                        lockForUpdate()
+                               │
+                               ▼
+                     ┌────────────────────┐
+                     │ Is every seat      │
+                     │ available?         │
+                     └──────┬───────┬─────┘
+                            │       │
+                           NO      YES
+                            │       │
+                        ROLLBACK    ▼
+                                Create booking
+                                     │
+                                10-min hold
+                                     │
+                               Seats RESERVED
+                                     │
+                        ┌────────────┴───────────┐
+                        │                        │
+                     PAYMENT                  EXPIRY
+                        │                        │
+                   Lock booking             Lock booking
+                        │                        │
+                   Still pending?            Still pending?
+                   Not expired?             Expired?
+                        │                        │
+                        ▼                        ▼
+                   PAID + BOOKED          EXPIRED + AVAILABLE
+                        │                        │
+                        └──────────┬─────────────┘
+                                   │
+                                   ▼
+                            CONSISTENT STATE
+```
